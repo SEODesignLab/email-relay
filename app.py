@@ -886,6 +886,68 @@ def get_pop_report():
 # HEALTH CHECK
 # ============================================================
 
+@app.route("/api/bulk_import", methods=["POST"])
+@require_prospector_key
+def bulk_import():
+    """Import prospects in bulk (for backfilling from WPX SQLite)."""
+    data = request.get_json()
+    if not data or not data.get("prospects"):
+        return jsonify({"error": "prospects array required"}), 400
+
+    prospects = data["prospects"]
+    db = sqlite3.connect(PROSPECTS_DB_PATH)
+    imported = 0
+    skipped = 0
+
+    for p in prospects:
+        try:
+            db.execute("""INSERT OR REPLACE INTO prospects 
+                (id, business_name, website, phone, address, city, state, niche, rating, reviews,
+                 seo_score, prospect_score, prospect_status, issues, has_ssl,
+                 pitch_subject, pitch_body, pitch_date, sent_date, contact_method,
+                 response_date, pop_report_data, pop_audit_date, pop_score,
+                 search_query, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (p.get("id"), p.get("business_name"), p.get("website"), p.get("phone"),
+                 p.get("address"), p.get("city"), p.get("state"), p.get("niche"),
+                 p.get("rating"), p.get("reviews"), p.get("seo_score", 0),
+                 p.get("prospect_score", 0), p.get("prospect_status", "new"),
+                 p.get("issues"), p.get("has_ssl", 0),
+                 p.get("pitch_subject"), p.get("pitch_body"), p.get("pitch_date"),
+                 p.get("sent_date"), p.get("contact_method"), p.get("response_date"),
+                 p.get("pop_report_data"), p.get("pop_audit_date"), p.get("pop_score"),
+                 p.get("search_query"), p.get("created_at"), p.get("updated_at")))
+            imported += 1
+        except Exception as e:
+            skipped += 1
+
+    db.commit()
+    db.close()
+    return jsonify({"success": True, "imported": imported, "skipped": skipped})
+
+
+# Also import searches
+@app.route("/api/bulk_import_searches", methods=["POST"])
+@require_prospector_key
+def bulk_import_searches():
+    data = request.get_json()
+    if not data or not data.get("searches"):
+        return jsonify({"error": "searches array required"}), 400
+
+    db = sqlite3.connect(PROSPECTS_DB_PATH)
+    imported = 0
+    for s in data["searches"]:
+        try:
+            db.execute("INSERT OR REPLACE INTO searches (id, query, niche, location, result_count, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (s.get("id"), s.get("query"), s.get("niche"), s.get("location"), s.get("result_count"), s.get("created_at")))
+            imported += 1
+        except Exception:
+            pass
+    db.commit()
+    db.close()
+    return jsonify({"success": True, "imported": imported})
+
+
 @app.route("/health", methods=["GET"])
 def health():
     try:
