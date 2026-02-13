@@ -20,7 +20,7 @@ FROM_ADDRESS = os.environ.get("FROM_ADDRESS", "milo@seodesignlab.com")
 TRACKER_KEY = os.environ.get("TRACKER_KEY", "sdl-email-2026")
 
 # SQLite for email tracking (persistent on Render with disk, in-memory fallback)
-DB_PATH = os.environ.get("DB_PATH", "/opt/render/project/data/tracking.db") if os.environ.get("RENDER") else "tracking.db"
+DB_PATH = os.environ.get("DB_PATH", "tracking.db")
 
 
 def get_db():
