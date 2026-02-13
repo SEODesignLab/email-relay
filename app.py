@@ -948,6 +948,141 @@ def bulk_import_searches():
     return jsonify({"success": True, "imported": imported})
 
 
+# ============================================================
+# PROPOSAL GENERATION
+# ============================================================
+
+NICHE_COLORS = {
+    "plumbing": ("#1a3d5c", "#2a6496"), "pool": ("#1a3d5c", "#2a6496"),
+    "pool service": ("#1a3d5c", "#2a6496"), "pool care": ("#1a3d5c", "#2a6496"),
+    "roofing": ("#5c1a1a", "#963a2a"), "painting": ("#1a4d2e", "#2d7a4a"),
+    "tree service": ("#2d4a1a", "#4a7a2d"), "landscaping": ("#2d4a1a", "#4a7a2d"),
+    "pressure washing": ("#1a3d4d", "#2a6a7a"), "cleaning": ("#1a3d4d", "#2a6a7a"),
+    "dental": ("#1a2d4d", "#2d4a7a"), "dentist": ("#1a2d4d", "#2d4a7a"),
+    "medical": ("#1a2d4d", "#2d4a7a"), "legal": ("#1a1a3d", "#2d2d5a"),
+    "attorney": ("#1a1a3d", "#2d2d5a"), "gym": ("#4d1a4d", "#7a2d7a"),
+    "med spa": ("#3d1a3d", "#5a2d5a"), "garage door": ("#3d2d1a", "#5a4a2d"),
+    "hvac": ("#1a3d5c", "#2a6496"), "auto": ("#3d3d3d", "#5a5a5a"),
+    "restaurant": ("#4d1a1a", "#7a2d2d"),
+}
+
+def get_niche_colors(niche):
+    n = niche.lower().strip()
+    for k, v in NICHE_COLORS.items():
+        if k in n:
+            return v
+    return ("#1a1a2e", "#2d2d5a")
+
+def dataforseo_api(endpoint, payload):
+    if not DATAFORSEO_LOGIN or not DATAFORSEO_PASSWORD:
+        return {}
+    try:
+        r = http_requests.post(
+            f"https://api.dataforseo.com/v3/{endpoint}",
+            json=payload, auth=(DATAFORSEO_LOGIN, DATAFORSEO_PASSWORD), timeout=60
+        )
+        d = r.json()
+        if d.get("tasks") and d["tasks"][0].get("result"):
+            return d["tasks"][0]["result"][0] if d["tasks"][0]["result"] else {}
+    except Exception as e:
+        app.logger.error(f"DataForSEO error: {e}")
+    return {}
+
+def fetch_prospect_seo_data(domain):
+    clean = domain.replace("https://","").replace("http://","").rstrip("/")
+    overview = dataforseo_api("dataforseo_labs/google/domain_rank_overview/live",
+        [{"target": clean, "language_code": "en", "location_code": 2840}])
+    ranked = dataforseo_api("dataforseo_labs/google/ranked_keywords/live",
+        [{"target": clean, "language_code": "en", "location_code": 2840, "limit": 50}])
+    competitors = dataforseo_api("dataforseo_labs/google/competitors_domain/live",
+        [{"target": clean, "language_code": "en", "location_code": 2840, "limit": 10}])
+
+    metrics = overview.get("metrics", {}).get("organic", {}) if overview else {}
+    result = {
+        "organic_traffic": metrics.get("etv", 0),
+        "keywords_count": metrics.get("count", 0),
+        "domain_rank": overview.get("rank", 0) if overview else 0,
+        "ranked_keywords": [], "keyword_opportunities": [], "competitors": [],
+    }
+    if ranked and ranked.get("items"):
+        for item in ranked["items"][:30]:
+            kw = item.get("keyword_data", {})
+            result["ranked_keywords"].append({
+                "keyword": kw.get("keyword",""), "position": item.get("rank_group",0),
+                "volume": kw.get("keyword_info",{}).get("search_volume",0),
+                "cpc": kw.get("keyword_info",{}).get("cpc",0),
+            })
+        for item in ranked["items"]:
+            pos = item.get("rank_group",0)
+            kw = item.get("keyword_data",{})
+            vol = kw.get("keyword_info",{}).get("search_volume",0)
+            if 11 <= pos <= 50 and vol >= 100:
+                result["keyword_opportunities"].append({
+                    "keyword": kw.get("keyword",""), "position": pos,
+                    "volume": vol, "cpc": kw.get("keyword_info",{}).get("cpc",0),
+                })
+    if competitors and competitors.get("items"):
+        for item in competitors["items"][:8]:
+            result["competitors"].append({
+                "domain": item.get("domain",""),
+                "organic_traffic": item.get("metrics",{}).get("organic",{}).get("etv",0),
+                "keywords": item.get("metrics",{}).get("organic",{}).get("count",0),
+            })
+    return result
+
+
+@app.route("/api/generate_proposal", methods=["POST"])
+@require_prospector_key
+def api_generate_proposal():
+    """Generate proposal HTML for a prospect. Returns dashboard + proposal HTML."""
+    data = request.get_json() or {}
+
+    # Get prospect data - either from DB or from request body
+    prospect_id = data.get("prospect_id")
+    if prospect_id:
+        db = get_prospects_db()
+        row = row_to_dict(db.execute("SELECT * FROM prospects WHERE id = ?", (prospect_id,)).fetchone())
+        if not row:
+            return jsonify({"error": "Prospect not found"}), 404
+        prospect = {
+            "prospect_name": data.get("prospect_name") or row.get("business_name", ""),
+            "prospect_domain": data.get("prospect_domain") or row.get("website", ""),
+            "niche": data.get("niche") or row.get("niche", ""),
+            "location": data.get("location") or f"{row.get('city','')}, {row.get('state','')}".strip(", "),
+            "contact_name": data.get("contact_name", ""),
+            "contact_email": data.get("contact_email", ""),
+            "contact_phone": data.get("contact_phone", ""),
+            "package": data.get("package", "premium"),
+        }
+    else:
+        prospect = {
+            "prospect_name": data.get("prospect_name", ""),
+            "prospect_domain": data.get("prospect_domain", ""),
+            "niche": data.get("niche", ""),
+            "location": data.get("location", ""),
+            "contact_name": data.get("contact_name", ""),
+            "contact_email": data.get("contact_email", ""),
+            "contact_phone": data.get("contact_phone", ""),
+            "package": data.get("package", "premium"),
+        }
+
+    if not prospect["prospect_name"] or not prospect["prospect_domain"]:
+        return jsonify({"error": "prospect_name and prospect_domain required"}), 400
+
+    # Fetch SEO data
+    seo_data = fetch_prospect_seo_data(prospect["prospect_domain"])
+
+    # Read templates from embedded or fallback
+    # On Render we won't have the template files, so we return seo_data
+    # and let the local script do the HTML generation
+    return jsonify({
+        "success": True,
+        "prospect": prospect,
+        "seo_data": seo_data,
+        "message": "SEO data fetched. Use local script for HTML generation.",
+    })
+
+
 @app.route("/health", methods=["GET"])
 def health():
     try:
