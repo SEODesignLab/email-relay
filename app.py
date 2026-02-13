@@ -1,6 +1,8 @@
 import os
 import smtplib
+import ssl
 import time
+import socket
 import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -17,6 +19,12 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 SMTP_USER = os.environ.get("SMTP_USER", "milo@seodesignlab.com")
 SMTP_PASS = os.environ.get("SMTP_PASS")
 FROM_ADDRESS = "milo@seodesignlab.com"
+
+# SOCKS5 proxy for SMTP (WPX blocks direct connections from cloud IPs)
+PROXY_HOST = os.environ.get("PROXY_HOST", "")
+PROXY_PORT = int(os.environ.get("PROXY_PORT", "0"))
+PROXY_USER = os.environ.get("PROXY_USER", "")
+PROXY_PASS = os.environ.get("PROXY_PASS", "")
 
 # Rate limiting - 10 emails per minute
 send_times = deque()
@@ -42,6 +50,35 @@ def check_rate_limit():
         return False
     send_times.append(now)
     return True
+
+
+def create_smtp_connection():
+    """Create SMTP_SSL connection, optionally through SOCKS5 proxy."""
+    context = ssl.create_default_context()
+
+    if PROXY_HOST and PROXY_PORT:
+        import socks
+        # Create a SOCKS5-wrapped socket
+        sock = socks.socksocket()
+        sock.set_proxy(
+            socks.SOCKS5,
+            PROXY_HOST,
+            PROXY_PORT,
+            username=PROXY_USER or None,
+            password=PROXY_PASS or None,
+        )
+        sock.settimeout(30)
+        sock.connect((SMTP_HOST, SMTP_PORT))
+        # Wrap with SSL
+        sock = context.wrap_socket(sock, server_hostname=SMTP_HOST)
+        server = smtplib.SMTP_SSL(host=SMTP_HOST, port=SMTP_PORT, context=context)
+        server.sock = sock
+        server.ehlo()
+    else:
+        server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=30)
+
+    server.login(SMTP_USER, SMTP_PASS)
+    return server
 
 
 @app.route("/send", methods=["POST"])
@@ -85,9 +122,11 @@ def send_email():
         if bcc:
             recipients += [a.strip() for a in bcc.split(",")]
 
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
-            server.login(SMTP_USER, SMTP_PASS)
+        server = create_smtp_connection()
+        try:
             server.sendmail(FROM_ADDRESS, recipients, msg.as_string())
+        finally:
+            server.quit()
 
         app.logger.info(f"Email sent to={to} subject={subject}")
         return jsonify({"success": True, "message": f"Email sent to {to}"})
@@ -99,7 +138,7 @@ def send_email():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "proxy": bool(PROXY_HOST)})
 
 
 if __name__ == "__main__":
