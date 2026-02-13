@@ -1,9 +1,7 @@
 import os
-import smtplib
-import ssl
 import time
-import socket
 import logging
+import requests
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, request, jsonify
@@ -14,17 +12,8 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 API_KEY = os.environ.get("API_KEY")
-SMTP_HOST = os.environ.get("SMTP_HOST", "s18.wpxhosting.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
-SMTP_USER = os.environ.get("SMTP_USER", "milo@seodesignlab.com")
-SMTP_PASS = os.environ.get("SMTP_PASS")
-FROM_ADDRESS = "milo@seodesignlab.com"
-
-# SOCKS5 proxy for SMTP (WPX blocks direct connections from cloud IPs)
-PROXY_HOST = os.environ.get("PROXY_HOST", "")
-PROXY_PORT = int(os.environ.get("PROXY_PORT", "0"))
-PROXY_USER = os.environ.get("PROXY_USER", "")
-PROXY_PASS = os.environ.get("PROXY_PASS", "")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+FROM_ADDRESS = os.environ.get("FROM_ADDRESS", "milo@seodesignlab.com")
 
 # Rate limiting - 10 emails per minute
 send_times = deque()
@@ -52,17 +41,6 @@ def check_rate_limit():
     return True
 
 
-def create_smtp_connection():
-    """Create SMTP_SSL connection, optionally through SOCKS5 proxy."""
-    context = ssl.create_default_context()
-
-    # Try direct connection first (no proxy - SOCKS5 blocks SMTP)
-    server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=45)
-
-    server.login(SMTP_USER, SMTP_PASS)
-    return server
-
-
 @app.route("/send", methods=["POST"])
 @require_api_key
 def send_email():
@@ -79,39 +57,48 @@ def send_email():
     html = data.get("html", "")
     cc = data.get("cc", "")
     bcc = data.get("bcc", "")
+    from_addr = data.get("from", FROM_ADDRESS)
 
     if not to:
         return jsonify({"error": "'to' field is required"}), 400
+    if not body and not html:
+        return jsonify({"error": "'body' or 'html' required"}), 400
 
     try:
-        msg = MIMEMultipart("alternative")
-        msg["From"] = FROM_ADDRESS
-        msg["To"] = to
-        msg["Subject"] = subject
-        if cc:
-            msg["Cc"] = cc
+        # Build Resend payload
+        payload = {
+            "from": from_addr,
+            "to": [a.strip() for a in to.split(",")] if isinstance(to, str) else to,
+            "subject": subject,
+        }
 
-        if body:
-            msg.attach(MIMEText(body, "plain"))
         if html:
-            msg.attach(MIMEText(html, "html"))
-        elif not body:
-            return jsonify({"error": "'body' or 'html' required"}), 400
-
-        recipients = [to]
+            payload["html"] = html
+        if body:
+            payload["text"] = body
         if cc:
-            recipients += [a.strip() for a in cc.split(",")]
+            payload["cc"] = [a.strip() for a in cc.split(",")] if isinstance(cc, str) else cc
         if bcc:
-            recipients += [a.strip() for a in bcc.split(",")]
+            payload["bcc"] = [a.strip() for a in bcc.split(",")] if isinstance(bcc, str) else bcc
 
-        server = create_smtp_connection()
-        try:
-            server.sendmail(FROM_ADDRESS, recipients, msg.as_string())
-        finally:
-            server.quit()
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
 
-        app.logger.info(f"Email sent to={to} subject={subject}")
-        return jsonify({"success": True, "message": f"Email sent to {to}"})
+        if resp.status_code in (200, 201):
+            result = resp.json()
+            app.logger.info(f"Email sent to={to} subject={subject} id={result.get('id')}")
+            return jsonify({"success": True, "message": f"Email sent to {to}", "id": result.get("id")})
+        else:
+            error = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"message": resp.text}
+            app.logger.error(f"Resend error: {resp.status_code} {error}")
+            return jsonify({"error": error.get("message", str(error)), "status_code": resp.status_code}), 502
 
     except Exception as e:
         app.logger.error(f"Send failed: {e}")
@@ -120,7 +107,7 @@ def send_email():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "proxy": bool(PROXY_HOST)})
+    return jsonify({"status": "ok", "provider": "resend"})
 
 
 if __name__ == "__main__":
