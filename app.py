@@ -15,6 +15,7 @@ from flask import Flask, request, jsonify, redirect, Response, g
 from flask_cors import CORS
 from functools import wraps
 from collections import deque
+import uuid
 from datetime import datetime as dt
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -548,6 +549,173 @@ def prospect_analyze():
         "url": url, "seo_score": seo_score, "prospect_score": prospect_score,
         "prospect_status": status, "issues": issues, "has_ssl": has_ssl
     })
+
+
+# --- Async POP Audit Job System ---
+pop_jobs = {}  # job_id -> {"status": "running"|"complete"|"error", "result": {...}, "started": timestamp}
+
+def _run_pop_audit_job(job_id, pid):
+    """Background worker for POP audit"""
+    try:
+        db = sqlite3.connect(PROSPECTS_DB_PATH)
+        db.row_factory = sqlite3.Row
+        prospect = dict(db.execute("SELECT * FROM prospects WHERE id = ?", (pid,)).fetchone())
+        db.close()
+
+        url = prospect["website"]
+        if not url.startswith("http"):
+            url = "https://" + url
+
+        keyword = f"{prospect.get('niche', '')} {prospect.get('city', '')}".strip()
+        if not keyword:
+            keyword = prospect.get("business_name", "business")
+
+        # Step 1: Get terms
+        terms_resp = http_requests.post(f"{POP_BASE}/expose/get-terms/", json={
+            "apiKey": POP_API_KEY,
+            "keyword": keyword,
+            "locationName": "United States",
+            "targetLanguage": "english",
+            "targetUrl": url
+        }, timeout=60)
+        terms_data = terms_resp.json()
+
+        task_id = terms_data.get("taskId") or terms_data.get("task_id")
+        if not task_id:
+            pop_jobs[job_id] = {"status": "error", "error": f"No taskId from POP: {terms_data}"}
+            return
+
+        # Poll for terms results
+        terms_result = None
+        for _ in range(200):
+            time.sleep(3)
+            r = http_requests.get(f"{POP_BASE}/task/{task_id}/results/", timeout=30)
+            rd = r.json()
+            if rd.get("status") == "complete" or rd.get("data"):
+                terms_result = rd
+                break
+
+        if not terms_result:
+            pop_jobs[job_id] = {"status": "error", "error": "POP terms timed out"}
+            return
+
+        # Step 2: Create report
+        prepare_id = terms_result.get("prepareId") or terms_result.get("data", {}).get("prepareId") or task_id
+        variations = terms_result.get("variations") or terms_result.get("data", {}).get("variations", [])
+        lsa_phrases = terms_result.get("lsaPhrases") or terms_result.get("data", {}).get("lsaPhrases", [])
+
+        report_resp = http_requests.post(f"{POP_BASE}/expose/create-report/", json={
+            "apiKey": POP_API_KEY,
+            "prepareId": prepare_id,
+            "variations": variations,
+            "lsaPhrases": lsa_phrases
+        }, timeout=60)
+        report_data = report_resp.json()
+
+        report_task_id = report_data.get("taskId") or report_data.get("task_id")
+        if report_task_id:
+            for _ in range(200):
+                time.sleep(3)
+                r = http_requests.get(f"{POP_BASE}/task/{report_task_id}/results/", timeout=30)
+                rd = r.json()
+                if rd.get("status") == "complete" or rd.get("report"):
+                    report_data = rd
+                    break
+
+        # Extract metrics
+        report = report_data.get("report", report_data.get("data", {}).get("report", report_data))
+        word_count_current = report.get("wordCount", 0)
+        word_count_target = report.get("recommendedWordCount", 0)
+        word_count_avg = report.get("averageWordCount", 0)
+        competitor_count = len(report.get("competitorInfo", {}).get("competitors", []))
+        tag_counts = report.get("tagCounts", {})
+        terms = report.get("terms", [])
+        missing_terms = [t["term"] for t in terms if t.get("count", 0) == 0][:10]
+
+        pop_score = 50
+        if word_count_target > 0:
+            if word_count_current < word_count_target * 0.5:
+                pop_score += 20
+            elif word_count_current < word_count_target:
+                pop_score += 10
+        if len(missing_terms) > 10:
+            pop_score += 25
+        elif len(missing_terms) > 5:
+            pop_score += 15
+        pop_score = min(100, pop_score)
+
+        if pop_score >= 80:
+            status = "hot"
+        elif pop_score >= 60:
+            status = "warm"
+        else:
+            status = "cold"
+
+        metrics = {
+            "word_count_current": word_count_current,
+            "word_count_target": word_count_target,
+            "word_count_avg": word_count_avg,
+            "competitor_count": competitor_count,
+            "tag_counts": tag_counts,
+            "missing_terms": missing_terms,
+            "missing_terms_count": len(missing_terms)
+        }
+
+        # Save to DB
+        db2 = sqlite3.connect(PROSPECTS_DB_PATH)
+        db2.execute("""UPDATE prospects SET pop_report_data=?, pop_audit_date=?, pop_score=?,
+            prospect_score=?, prospect_status=?, updated_at=? WHERE id=?""",
+            (json.dumps({"metrics": metrics, "report_data": report_data}), now_str(), pop_score, pop_score, status, now_str(), pid))
+        db2.commit()
+        db2.close()
+
+        pop_jobs[job_id] = {"status": "complete", "result": {"success": True, "metrics": metrics, "scoring": {"pop_score": pop_score, "status": status}}}
+
+    except Exception as e:
+        pop_jobs[job_id] = {"status": "error", "error": str(e)}
+
+
+@app.route("/api/pop_audit_start", methods=["POST", "GET"])
+@require_prospector_key
+def pop_audit_start():
+    """Start async POP audit - returns job_id immediately"""
+    pid = request.args.get("prospect_id") or (request.json.get("prospect_id") if request.is_json else None)
+    if not pid:
+        return jsonify({"error": "prospect_id required"}), 400
+
+    db = get_prospects_db()
+    prospect = row_to_dict(db.execute("SELECT * FROM prospects WHERE id = ?", (pid,)).fetchone())
+    if not prospect:
+        return jsonify({"error": "Prospect not found"}), 404
+
+    job_id = str(uuid.uuid4())[:8]
+    pop_jobs[job_id] = {"status": "running", "started": time.time()}
+    t = threading.Thread(target=_run_pop_audit_job, args=(job_id, int(pid)), daemon=True)
+    t.start()
+
+    return jsonify({"success": True, "job_id": job_id, "status": "running", "message": "POP audit started. Poll /api/pop_audit_status?job_id=X for results."})
+
+
+@app.route("/api/pop_audit_status", methods=["GET"])
+@require_prospector_key
+def pop_audit_status():
+    """Poll for async POP audit result"""
+    job_id = request.args.get("job_id")
+    if not job_id or job_id not in pop_jobs:
+        return jsonify({"error": "Invalid or unknown job_id"}), 404
+
+    job = pop_jobs[job_id]
+    if job["status"] == "running":
+        elapsed = int(time.time() - job.get("started", 0))
+        return jsonify({"status": "running", "elapsed_seconds": elapsed})
+    elif job["status"] == "complete":
+        result = job["result"]
+        del pop_jobs[job_id]  # cleanup
+        return jsonify(result)
+    else:
+        error = job.get("error", "Unknown error")
+        del pop_jobs[job_id]
+        return jsonify({"status": "error", "error": error}), 500
 
 
 @app.route("/api/pop_audit", methods=["POST", "GET"])
