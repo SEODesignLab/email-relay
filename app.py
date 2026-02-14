@@ -1054,45 +1054,67 @@ def get_pop_report():
     # Extract processed metrics for the frontend modal
     metrics = None
     keyword = prospect.get("business_name", "")
+    website = prospect.get("website", "")
     if pop_data and isinstance(pop_data, dict):
         report = pop_data.get("report_data", {}).get("report", pop_data.get("report", {}))
         if report:
             word_count = report.get("wordCount", {})
             tag_counts = report.get("tagCounts", [])
+            cb = report.get("cleanedContentBrief", {})
+            p_total = cb.get("pTotal", {})
+            page_score_data = cb.get("pageScore", {})
+            page_score = 0
+            if isinstance(page_score_data, dict):
+                page_score = page_score_data.get("pageScore", 0)
+            elif isinstance(page_score_data, (int, float)):
+                page_score = page_score_data
+
+            keyword = report.get("keyword", keyword)
+            website = report.get("url", website)
+
             metrics = {
-                "page_score": prospect.get("pop_score") or report.get("pageScore", 0),
+                "page_score": round(page_score, 1),
                 "word_count_current": word_count.get("current", 0),
                 "word_count_target": word_count.get("target", 0),
                 "word_count_avg": word_count.get("competitorAvg", word_count.get("avg", 0)),
-                "competitor_count": report.get("competitorCount", 0),
+                "competitor_count": len(report.get("competitors", [])),
                 "tag_counts": tag_counts if isinstance(tag_counts, list) else [],
-                "terms": []
+                "terms_current": p_total.get("current", 0),
+                "terms_target_min": p_total.get("min", 0),
+                "terms_target_max": p_total.get("max", 0),
+                "terms": [],
+                "related_questions": report.get("relatedQuestions", []),
+                "lsa_variations": [v.get("phrase", v) if isinstance(v, dict) else v for v in report.get("lsaVariations", [])[:10]],
+                "related_searches": [v.get("phrase", v) if isinstance(v, dict) else v for v in report.get("relatedSearches", [])[:8]],
+                "competitors": report.get("competitors", []),
+                "schema_types": report.get("schemaTypes", []),
+                "ai_schema_types": report.get("aiGenSchemaTypes", []),
+                "missing_terms": [],
+                "target_schema": report.get("schemaTypes", []) or report.get("aiGenSchemaTypes", [])
             }
-            # Extract keyword from terms
-            cb = report.get("cleanedContentBrief", {})
+            # Extract all content brief terms
             if cb and cb.get("p"):
                 for item in cb["p"]:
-                    term_info = item.get("term", {})
-                    if term_info.get("type") == "keyword":
-                        keyword = term_info.get("phrase", keyword)
-                        break
-                # Get top missing terms
-                for item in cb["p"][:20]:
                     t = item.get("term", {})
                     brief = item.get("contentBrief", {})
                     current = brief.get("current", 0)
-                    target = brief.get("target", brief.get("targetMin", 0))
-                    if target > current:
-                        metrics["terms"].append({
-                            "phrase": t.get("phrase", ""),
-                            "current": current,
-                            "target": target,
-                            "type": t.get("type", "")
-                        })
+                    target_min = brief.get("targetMin", brief.get("target", 0))
+                    target_max = brief.get("targetMax", target_min)
+                    metrics["terms"].append({
+                        "phrase": t.get("phrase", ""),
+                        "current": current,
+                        "target_min": target_min,
+                        "target_max": target_max,
+                        "type": t.get("type", ""),
+                        "weight": t.get("weight", 0),
+                        "met": current >= target_min if target_min > 0 else (current > 0)
+                    })
+                    if current < target_min and target_min > 0:
+                        metrics["missing_terms"].append(t.get("phrase", ""))
     return jsonify({
-        "success": True, "prospect_id": pid, "pop_data": pop_data,
+        "success": True, "prospect_id": pid,
         "pop_audit_date": prospect.get("pop_audit_date"), "pop_score": prospect.get("pop_score"),
-        "metrics": metrics, "keyword": keyword, "website": prospect.get("website", ""),
+        "metrics": metrics, "keyword": keyword, "website": website,
         "audit_date": prospect.get("pop_audit_date")
     })
 
