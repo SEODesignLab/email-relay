@@ -1051,7 +1051,50 @@ def get_pop_report():
             pop_data = json.loads(prospect["pop_report_data"])
         except Exception:
             pop_data = prospect["pop_report_data"]
-    return jsonify({"success": True, "prospect_id": pid, "pop_data": pop_data, "pop_audit_date": prospect.get("pop_audit_date"), "pop_score": prospect.get("pop_score")})
+    # Extract processed metrics for the frontend modal
+    metrics = None
+    keyword = prospect.get("business_name", "")
+    if pop_data and isinstance(pop_data, dict):
+        report = pop_data.get("report_data", {}).get("report", pop_data.get("report", {}))
+        if report:
+            word_count = report.get("wordCount", {})
+            tag_counts = report.get("tagCounts", [])
+            metrics = {
+                "page_score": prospect.get("pop_score") or report.get("pageScore", 0),
+                "word_count_current": word_count.get("current", 0),
+                "word_count_target": word_count.get("target", 0),
+                "word_count_avg": word_count.get("competitorAvg", word_count.get("avg", 0)),
+                "competitor_count": report.get("competitorCount", 0),
+                "tag_counts": tag_counts if isinstance(tag_counts, list) else [],
+                "terms": []
+            }
+            # Extract keyword from terms
+            cb = report.get("cleanedContentBrief", {})
+            if cb and cb.get("p"):
+                for item in cb["p"]:
+                    term_info = item.get("term", {})
+                    if term_info.get("type") == "keyword":
+                        keyword = term_info.get("phrase", keyword)
+                        break
+                # Get top missing terms
+                for item in cb["p"][:20]:
+                    t = item.get("term", {})
+                    brief = item.get("contentBrief", {})
+                    current = brief.get("current", 0)
+                    target = brief.get("target", brief.get("targetMin", 0))
+                    if target > current:
+                        metrics["terms"].append({
+                            "phrase": t.get("phrase", ""),
+                            "current": current,
+                            "target": target,
+                            "type": t.get("type", "")
+                        })
+    return jsonify({
+        "success": True, "prospect_id": pid, "pop_data": pop_data,
+        "pop_audit_date": prospect.get("pop_audit_date"), "pop_score": prospect.get("pop_score"),
+        "metrics": metrics, "keyword": keyword, "website": prospect.get("website", ""),
+        "audit_date": prospect.get("pop_audit_date")
+    })
 
 
 # ============================================================
