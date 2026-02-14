@@ -628,7 +628,9 @@ def _run_pop_audit_job(job_id, pid):
         word_count_target = report.get("recommendedWordCount", 0)
         word_count_avg = report.get("averageWordCount", 0)
         competitor_count = len(report.get("competitorInfo", {}).get("competitors", []))
-        tag_counts = report.get("tagCounts", {})
+        tag_counts = report.get("tagCounts", [])  # This is a LIST from POP API
+        if isinstance(tag_counts, dict):
+            tag_counts = list(tag_counts.values()) if tag_counts else []
         terms = report.get("terms", [])
         missing_terms = [t["term"] for t in terms if t.get("count", 0) == 0][:10]
 
@@ -806,7 +808,9 @@ def pop_audit():
     word_count_target = report.get("recommendedWordCount", 0)
     word_count_avg = report.get("averageWordCount", 0)
     competitor_count = len(report.get("competitorInfo", {}).get("competitors", []))
-    tag_counts = report.get("tagCounts", {})
+    tag_counts = report.get("tagCounts", [])
+    if isinstance(tag_counts, dict):
+        tag_counts = list(tag_counts.values()) if tag_counts else []
     terms = report.get("terms", [])
     missing_terms = [t["term"] for t in terms if t.get("count", 0) == 0][:10]
 
