@@ -123,6 +123,8 @@ def init_prospects_db():
         pop_report_data TEXT,
         pop_audit_date TEXT,
         pop_score INTEGER,
+        pop_word_count_current INTEGER DEFAULT 0,
+        pop_word_count_target INTEGER DEFAULT 0,
         search_query TEXT,
         created_at TEXT DEFAULT (datetime('now')),
         updated_at TEXT DEFAULT (datetime('now'))
@@ -665,9 +667,11 @@ def _run_pop_audit_job(job_id, pid):
 
         # Save to DB
         db2 = sqlite3.connect(PROSPECTS_DB_PATH)
+        wc_current = report.get("wordCount", {}).get("current", 0) if report else 0
+        wc_target = report.get("wordCount", {}).get("target", 0) if report else 0
         db2.execute("""UPDATE prospects SET pop_report_data=?, pop_audit_date=?, pop_score=?,
-            prospect_score=?, prospect_status=?, updated_at=? WHERE id=?""",
-            (json.dumps({"metrics": metrics, "report_data": report_data}), now_str(), pop_score, pop_score, status, now_str(), pid))
+            prospect_score=?, prospect_status=?, pop_word_count_current=?, pop_word_count_target=?, updated_at=? WHERE id=?""",
+            (json.dumps({"metrics": metrics, "report_data": report_data}), now_str(), pop_score, pop_score, status, wc_current, wc_target, now_str(), pid))
         db2.commit()
         db2.close()
 
@@ -1318,6 +1322,38 @@ def api_generate_proposal():
         "seo_data": seo_data,
         "message": "SEO data fetched. Use local script for HTML generation.",
     })
+
+
+@app.route("/api/backfill_word_counts", methods=["POST"])
+@require_prospector_key
+def backfill_word_counts():
+    """Extract word counts from existing POP report JSON into dedicated columns."""
+    db = get_prospects_db()
+    # Add columns if missing
+    cols = [c[1] for c in db.execute("PRAGMA table_info(prospects)").fetchall()]
+    if "pop_word_count_current" not in cols:
+        db.execute("ALTER TABLE prospects ADD COLUMN pop_word_count_current INTEGER DEFAULT 0")
+    if "pop_word_count_target" not in cols:
+        db.execute("ALTER TABLE prospects ADD COLUMN pop_word_count_target INTEGER DEFAULT 0")
+    db.commit()
+    
+    rows = db.execute("SELECT id, pop_report_data FROM prospects WHERE pop_report_data IS NOT NULL AND pop_report_data != ''").fetchall()
+    updated = 0
+    for row in rows:
+        pid, raw = row
+        try:
+            data = json.loads(raw)
+            report = data.get("report_data", {}).get("report", data.get("report", {}))
+            wc = report.get("wordCount", {})
+            current = wc.get("current", 0)
+            target = wc.get("target", 0)
+            if current > 0 or target > 0:
+                db.execute("UPDATE prospects SET pop_word_count_current=?, pop_word_count_target=? WHERE id=?", (current, target, pid))
+                updated += 1
+        except Exception:
+            continue
+    db.commit()
+    return jsonify({"success": True, "updated": updated, "total_with_pop": len(rows)})
 
 
 @app.route("/health", methods=["GET"])
