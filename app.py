@@ -1050,6 +1050,67 @@ def pop_audit():
     return jsonify({"success": True, "metrics": metrics, "scoring": {"pop_score": pop_score, "status": status}})
 
 
+@app.route('/api/backfill_pop_scores', methods=['POST'])
+def backfill_pop_scores():
+    key = request.args.get('key')
+    if key != API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+    
+    db = get_db()
+    # Get all prospects with pop_report_data
+    rows = db.execute("SELECT id, pop_report_data, pop_score, pop_word_count_current, pop_word_count_target FROM prospects WHERE pop_report_data IS NOT NULL").fetchall()
+    
+    fixed = []
+    for row in rows:
+        try:
+            data = json.loads(row['pop_report_data'])
+            metrics = data.get('metrics', {})
+            
+            page_score = metrics.get('page_score', 0)
+            wc_current = metrics.get('word_count_current', 0)
+            wc_target = metrics.get('word_count_target', 0)
+            
+            # Recalculate pop_score using same logic as pop_audit endpoint
+            new_score = 50
+            if page_score >= 40:
+                new_score += 30
+            elif page_score >= 25:
+                new_score += 20
+            elif page_score >= 10:
+                new_score += 10
+            
+            word_gap_pct = ((wc_target - wc_current) / wc_target * 100) if wc_target > 0 else 0
+            if word_gap_pct > 50:
+                new_score += 15
+            elif word_gap_pct > 25:
+                new_score += 10
+            elif word_gap_pct > 0:
+                new_score += 5
+            new_score = min(100, new_score)
+            
+            # Determine status
+            if new_score >= 80:
+                status = 'hot'
+            elif new_score >= 60:
+                status = 'warm'
+            else:
+                status = 'cold'
+            
+            old_score = row['pop_score']
+            wc_cur_db = row['pop_word_count_current'] or 0
+            wc_target_db = row['pop_word_count_target'] or 0
+            
+            if old_score != new_score or wc_cur_db == 0 or wc_target_db == 0:
+                db.execute("UPDATE prospects SET pop_score=?, prospect_status=?, pop_word_count_current=?, pop_word_count_target=? WHERE id=?", 
+                           (new_score, status, wc_current, wc_target, row['id']))
+                fixed.append({"id": row['id'], "old_score": old_score, "new_score": new_score, "status": status, "page_score": page_score})
+        except Exception as e:
+            fixed.append({"id": row['id'], "error": str(e)})
+    
+    db.commit()
+    return jsonify({"success": True, "fixed": len([f for f in fixed if 'new_score' in f]), "details": fixed})
+
+
 @app.route("/api/pitch")
 @require_prospector_key
 def prospect_pitch():
