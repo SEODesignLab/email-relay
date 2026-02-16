@@ -1056,6 +1056,13 @@ def backfill_pop_scores():
     if key != PROSPECTOR_KEY:
         return jsonify({"error": "unauthorized"}), 401
     
+    try:
+        return _do_backfill()
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
+
+def _do_backfill():
     db = get_db()
     # Get all prospects with pop_report_data
     rows = db.execute("SELECT id, pop_report_data, pop_score FROM prospects WHERE pop_report_data IS NOT NULL").fetchall()
@@ -1105,7 +1112,10 @@ def backfill_pop_scores():
         except Exception as e:
             fixed.append({"id": row['id'], "error": str(e)})
     
-    db.commit()
+    try:
+        db.commit()
+    except Exception as e:
+        return jsonify({"error": f"commit failed: {str(e)}"}), 500
     return jsonify({"success": True, "fixed": len([f for f in fixed if 'new_score' in f]), "details": fixed})
 
 
