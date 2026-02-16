@@ -1063,7 +1063,8 @@ def backfill_pop_scores():
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 def _do_backfill():
-    db = get_db()
+    db = sqlite3.connect(PROSPECTS_DB_PATH)
+    db.row_factory = sqlite3.Row
     # Get all prospects with pop_report_data
     rows = db.execute("SELECT id, pop_report_data, pop_score FROM prospects WHERE pop_report_data IS NOT NULL").fetchall()
     
@@ -1115,7 +1116,9 @@ def _do_backfill():
     try:
         db.commit()
     except Exception as e:
+        db.close()
         return jsonify({"error": f"commit failed: {str(e)}"}), 500
+    db.close()
     return jsonify({"success": True, "fixed": len([f for f in fixed if 'new_score' in f]), "details": fixed})
 
 
