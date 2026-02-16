@@ -1053,7 +1053,7 @@ def pop_audit():
 @app.route('/api/backfill_pop_scores', methods=['POST'])
 def backfill_pop_scores():
     key = request.args.get('key')
-    if key != API_KEY:
+    if key != PROSPECTOR_KEY:
         return jsonify({"error": "unauthorized"}), 401
     
     db = get_db()
