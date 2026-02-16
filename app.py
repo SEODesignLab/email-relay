@@ -556,7 +556,7 @@ def prospect_analyze():
 # --- Async POP Audit Job System ---
 pop_jobs = {}  # job_id -> {"status": "running"|"complete"|"error", "result": {...}, "started": timestamp, "progress": str}
 
-def _poll_pop_task(task_id, step_name="task", max_attempts=240, poll_interval=3):
+def _poll_pop_task(task_id, step_name="task", max_attempts=360, poll_interval=5):
     """
     Poll POP API task until complete.
     Returns the final result or raises exception on timeout/failure.
@@ -568,7 +568,7 @@ def _poll_pop_task(task_id, step_name="task", max_attempts=240, poll_interval=3)
     """
     for attempt in range(max_attempts):
         try:
-            r = http_requests.get(f"{POP_BASE}/task/{task_id}/results/", timeout=30)
+            r = http_requests.get(f"{POP_BASE}/task/{task_id}/results/", timeout=60)
             r.raise_for_status()
             data = r.json()
             
@@ -585,7 +585,15 @@ def _poll_pop_task(task_id, step_name="task", max_attempts=240, poll_interval=3)
             if value == 100 and (data.get("prepareId") or data.get("data", {}).get("prepareId") or data.get("report")):
                 return data
             elif status == "FAILURE":
-                raise Exception(f"POP {step_name} failed: {msg}")
+                # Capture full response for debugging - POP often returns error details in different fields
+                error_details = {
+                    "msg": msg,
+                    "task_id": task_id,
+                    "status": status,
+                    "value": value,
+                    "full_response": data
+                }
+                raise Exception(f"POP {step_name} failed: {json.dumps(error_details)}")
             elif status == "PROGRESS":
                 time.sleep(poll_interval)
                 continue
@@ -680,14 +688,47 @@ def _run_pop_audit_job(job_id, pid):
             "googleNlpCalculation": 0
         }
         
-        report_resp = http_requests.post(f"{POP_BASE}/expose/create-report/", json=report_payload, timeout=120)
-        report_resp.raise_for_status()
-        report_data = report_resp.json()
+        # Try create-report with one retry on FAILURE
+        max_retries = 2
+        report_data = None
+        last_error = None
         
-        app.logger.info(f"POP audit {job_id}: create-report response: {json.dumps(report_data)[:500]}")
+        for attempt in range(max_retries):
+            try:
+                report_resp = http_requests.post(f"{POP_BASE}/expose/create-report/", json=report_payload, timeout=180)
+                report_resp.raise_for_status()
+                report_data = report_resp.json()
+                
+                app.logger.info(f"POP audit {job_id}: create-report response (attempt {attempt+1}): {json.dumps(report_data)[:500]}")
 
-        if report_data.get("status") == "FAILURE":
-            raise Exception(f"POP create-report failed: {report_data.get('msg', 'Unknown error')}")
+                if report_data.get("status") == "FAILURE":
+                    # Capture full error details
+                    error_details = {
+                        "msg": report_data.get("msg", "Unknown error"),
+                        "attempt": attempt + 1,
+                        "full_response": report_data
+                    }
+                    last_error = json.dumps(error_details)
+                    if attempt < max_retries - 1:
+                        app.logger.warning(f"POP audit {job_id}: create-report failed, retrying in 10s... Error: {last_error}")
+                        pop_jobs[job_id]["progress"] = f"Step 2/3: Retrying create-report (attempt {attempt+2}/{max_retries})..."
+                        time.sleep(10)
+                        continue
+                    else:
+                        raise Exception(f"POP create-report failed after {max_retries} attempts: {last_error}")
+                else:
+                    # Success or other non-failure status
+                    break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    app.logger.warning(f"POP audit {job_id}: create-report error, retrying... {e}")
+                    pop_jobs[job_id]["progress"] = f"Step 2/3: Retrying create-report (attempt {attempt+2}/{max_retries})..."
+                    time.sleep(10)
+                else:
+                    raise
+        
+        if report_data is None:
+            raise Exception(f"POP create-report failed: no response after {max_retries} attempts")
 
         report_task_id = report_data.get("taskId") or report_data.get("task_id")
         
