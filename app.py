@@ -593,7 +593,7 @@ def _run_pop_audit_job(job_id, pid):
             time.sleep(3)
             r = http_requests.get(f"{POP_BASE}/task/{task_id}/results/", timeout=30)
             rd = r.json()
-            if rd.get("status") == "complete" or rd.get("data"):
+            if rd.get("status") in ("complete", "SUCCESS") or rd.get("data"):
                 terms_result = rd
                 break
 
@@ -620,7 +620,7 @@ def _run_pop_audit_job(job_id, pid):
                 time.sleep(3)
                 r = http_requests.get(f"{POP_BASE}/task/{report_task_id}/results/", timeout=30)
                 rd = r.json()
-                if rd.get("status") == "complete" or rd.get("report"):
+                if rd.get("status") in ("complete", "SUCCESS") or rd.get("report"):
                     report_data = rd
                     break
 
@@ -768,7 +768,7 @@ def pop_audit():
         try:
             r = http_requests.get(f"{POP_BASE}/task/{task_id}/results/", timeout=30)
             rd = r.json()
-            if rd.get("status") == "complete" or rd.get("data"):
+            if rd.get("status") in ("complete", "SUCCESS") or rd.get("data"):
                 terms_result = rd
                 break
         except Exception:
@@ -800,7 +800,7 @@ def pop_audit():
             try:
                 r = http_requests.get(f"{POP_BASE}/task/{report_task_id}/results/", timeout=30)
                 rd = r.json()
-                if rd.get("status") == "complete" or rd.get("report"):
+                if rd.get("status") in ("complete", "SUCCESS") or rd.get("report"):
                     report_data = rd
                     break
             except Exception:
