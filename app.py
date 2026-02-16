@@ -554,11 +554,58 @@ def prospect_analyze():
 
 
 # --- Async POP Audit Job System ---
-pop_jobs = {}  # job_id -> {"status": "running"|"complete"|"error", "result": {...}, "started": timestamp}
+pop_jobs = {}  # job_id -> {"status": "running"|"complete"|"error", "result": {...}, "started": timestamp, "progress": str}
+
+def _poll_pop_task(task_id, step_name="task", max_attempts=240, poll_interval=3):
+    """
+    Poll POP API task until complete.
+    Returns the final result or raises exception on timeout/failure.
+    
+    POP API status values:
+    - "PROGRESS" = still running
+    - "SUCCESS" = complete
+    - "FAILURE" = failed
+    """
+    for attempt in range(max_attempts):
+        try:
+            r = http_requests.get(f"{POP_BASE}/task/{task_id}/results/", timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            
+            status = data.get("status", "")
+            value = data.get("value", 0)
+            msg = data.get("msg", "")
+            
+            app.logger.info(f"POP {step_name} poll (attempt {attempt+1}): status={status}, value={value}, msg={msg}")
+            
+            if status == "SUCCESS" or value == 100:
+                return data
+            elif status == "FAILURE":
+                raise Exception(f"POP {step_name} failed: {msg}")
+            elif status == "PROGRESS":
+                time.sleep(poll_interval)
+                continue
+            else:
+                # Unknown status, check if we have data anyway
+                if data.get("prepareId") or data.get("report") or data.get("data"):
+                    return data
+                time.sleep(poll_interval)
+                
+        except http_requests.exceptions.RequestException as e:
+            app.logger.warning(f"POP {step_name} poll error: {e}, retrying...")
+            time.sleep(poll_interval)
+    
+    raise TimeoutError(f"POP {step_name} timed out after {max_attempts * poll_interval} seconds")
+
 
 def _run_pop_audit_job(job_id, pid):
-    """Background worker for POP audit"""
+    """Background worker for POP audit - runs full 3-step flow"""
+    app.logger.info(f"Starting POP audit job {job_id} for prospect {pid}")
+    
     try:
+        # Update job status with progress
+        pop_jobs[job_id]["progress"] = "Fetching prospect data..."
+        
         db = sqlite3.connect(PROSPECTS_DB_PATH)
         db.row_factory = sqlite3.Row
         prospect = dict(db.execute("SELECT * FROM prospects WHERE id = ?", (pid,)).fetchone())
@@ -572,80 +619,149 @@ def _run_pop_audit_job(job_id, pid):
         if not keyword:
             keyword = prospect.get("business_name", "business")
 
-        # Step 1: Get terms
+        app.logger.info(f"POP audit {job_id}: keyword='{keyword}', url='{url}'")
+
+        # ==================== STEP 1: Get Terms ====================
+        pop_jobs[job_id]["progress"] = "Step 1/3: Getting search terms from POP..."
+        
         terms_resp = http_requests.post(f"{POP_BASE}/expose/get-terms/", json={
             "apiKey": POP_API_KEY,
             "keyword": keyword,
             "locationName": "United States",
             "targetLanguage": "english",
             "targetUrl": url
-        }, timeout=60)
+        }, timeout=120)
+        terms_resp.raise_for_status()
         terms_data = terms_resp.json()
+        
+        app.logger.info(f"POP audit {job_id}: get-terms response: {json.dumps(terms_data)[:500]}")
+
+        if terms_data.get("status") == "FAILURE":
+            raise Exception(f"POP get-terms failed: {terms_data.get('msg', 'Unknown error')}")
 
         task_id = terms_data.get("taskId") or terms_data.get("task_id")
         if not task_id:
-            pop_jobs[job_id] = {"status": "error", "error": f"No taskId from POP: {terms_data}"}
-            return
+            # If no taskId, maybe it's a direct response
+            if terms_data.get("prepareId"):
+                terms_result = terms_data
+            else:
+                raise Exception(f"No taskId from POP get-terms: {terms_data}")
+        else:
+            # Poll for terms results (can take ~3 minutes)
+            pop_jobs[job_id]["progress"] = f"Step 1/3: Polling for terms (task {task_id[:8]}...)"
+            terms_result = _poll_pop_task(task_id, "get-terms", max_attempts=200, poll_interval=3)
 
-        # Poll for terms results
-        terms_result = None
-        for _ in range(200):
-            time.sleep(3)
-            r = http_requests.get(f"{POP_BASE}/task/{task_id}/results/", timeout=30)
-            rd = r.json()
-            if rd.get("status") in ("complete", "SUCCESS") or rd.get("data"):
-                terms_result = rd
-                break
+        app.logger.info(f"POP audit {job_id}: terms result received")
+        
+        # Extract data from terms response (handle nested structure)
+        result_data = terms_result.get("data", terms_result)
+        prepare_id = result_data.get("prepareId")
+        variations = result_data.get("variations", [])
+        lsa_phrases = result_data.get("lsaPhrases", [])
+        
+        if not prepare_id:
+            raise Exception(f"No prepareId in terms response: {terms_result}")
 
-        if not terms_result:
-            pop_jobs[job_id] = {"status": "error", "error": "POP terms timed out"}
-            return
-
-        # Step 2: Create report
-        prepare_id = terms_result.get("prepareId") or terms_result.get("data", {}).get("prepareId") or task_id
-        variations = terms_result.get("variations") or terms_result.get("data", {}).get("variations", [])
-        lsa_phrases = terms_result.get("lsaPhrases") or terms_result.get("data", {}).get("lsaPhrases", [])
-
-        report_resp = http_requests.post(f"{POP_BASE}/expose/create-report/", json={
+        # ==================== STEP 2: Create Report ====================
+        pop_jobs[job_id]["progress"] = "Step 2/3: Creating optimization report..."
+        
+        report_payload = {
             "apiKey": POP_API_KEY,
             "prepareId": prepare_id,
             "variations": variations,
-            "lsaPhrases": lsa_phrases
-        }, timeout=60)
+            "lsaPhrases": lsa_phrases,
+            "strategy": "target",
+            "approach": "regular",
+            "eeatCalculation": 0,
+            "googleNlpCalculation": 0
+        }
+        
+        report_resp = http_requests.post(f"{POP_BASE}/expose/create-report/", json=report_payload, timeout=120)
+        report_resp.raise_for_status()
         report_data = report_resp.json()
+        
+        app.logger.info(f"POP audit {job_id}: create-report response: {json.dumps(report_data)[:500]}")
+
+        if report_data.get("status") == "FAILURE":
+            raise Exception(f"POP create-report failed: {report_data.get('msg', 'Unknown error')}")
 
         report_task_id = report_data.get("taskId") or report_data.get("task_id")
+        
         if report_task_id:
-            for _ in range(200):
-                time.sleep(3)
-                r = http_requests.get(f"{POP_BASE}/task/{report_task_id}/results/", timeout=30)
-                rd = r.json()
-                if rd.get("status") in ("complete", "SUCCESS") or rd.get("report"):
-                    report_data = rd
-                    break
+            # Poll for report results (can take another ~3 minutes)
+            pop_jobs[job_id]["progress"] = f"Step 3/3: Polling for report (task {report_task_id[:8]}...)"
+            final_report = _poll_pop_task(report_task_id, "create-report", max_attempts=200, poll_interval=3)
+        else:
+            # Direct response
+            final_report = report_data
 
-        # Extract metrics
-        report = report_data.get("report", report_data.get("data", {}).get("report", report_data))
-        word_count_current = report.get("wordCount", 0)
-        word_count_target = report.get("recommendedWordCount", 0)
-        word_count_avg = report.get("averageWordCount", 0)
-        competitor_count = len(report.get("competitorInfo", {}).get("competitors", []))
-        tag_counts = report.get("tagCounts", [])  # This is a LIST from POP API
+        app.logger.info(f"POP audit {job_id}: final report received")
+        
+        # ==================== Extract Metrics ====================
+        # Navigate the nested structure
+        report_wrapper = final_report.get("data", final_report)
+        report = report_wrapper.get("report", report_wrapper)
+        
+        # Word counts (handle both nested and flat structures)
+        word_count = report.get("wordCount", {})
+        if isinstance(word_count, dict):
+            word_count_current = word_count.get("current", 0)
+            word_count_target = word_count.get("target", word_count.get("recommendation", 0))
+            word_count_avg = word_count.get("competitorAvg", word_count.get("average", word_count.get("avg", 0)))
+        else:
+            word_count_current = word_count
+            word_count_target = report.get("recommendedWordCount", 0)
+            word_count_avg = report.get("averageWordCount", 0)
+
+        # Competitors
+        competitor_info = report.get("competitorInfo", {})
+        competitors = competitor_info.get("competitors", [])
+        competitor_count = len(competitors)
+
+        # Tag counts (POP returns a list)
+        tag_counts = report.get("tagCounts", [])
         if isinstance(tag_counts, dict):
             tag_counts = list(tag_counts.values()) if tag_counts else []
-        terms = report.get("terms", [])
-        missing_terms = [t["term"] for t in terms if t.get("count", 0) == 0][:10]
 
-        pop_score = 50
-        if word_count_target > 0:
-            if word_count_current < word_count_target * 0.5:
+        # Terms and missing terms
+        terms = report.get("terms", [])
+        missing_terms = [t.get("term", t.get("phrase", "")) for t in terms if t.get("count", 0) == 0][:20]
+
+        # Page score from cleanedContentBrief
+        cleaned_brief = report.get("cleanedContentBrief", {})
+        page_score_data = cleaned_brief.get("pageScore", {})
+        page_score = 0
+        if isinstance(page_score_data, dict):
+            page_score = page_score_data.get("pageScore", 0)
+        elif isinstance(page_score_data, (int, float)):
+            page_score = page_score_data
+
+        # Calculate prospect score
+        pop_score = 50  # Base score
+        reasons = []
+        
+        if word_count_target > 0 and word_count_current > 0:
+            wc_percent = (word_count_current / word_count_target) * 100
+            if wc_percent < 30:
+                pop_score += 30
+                reasons.append(f"Severe content gap ({word_count_current} vs {word_count_target} words)")
+            elif wc_percent < 50:
                 pop_score += 20
-            elif word_count_current < word_count_target:
+                reasons.append(f"Major content gap ({word_count_current} vs {word_count_target} words)")
+            elif wc_percent < 70:
                 pop_score += 10
-        if len(missing_terms) > 10:
-            pop_score += 25
-        elif len(missing_terms) > 5:
+                reasons.append(f"Content below target ({word_count_current} vs {word_count_target} words)")
+
+        if len(missing_terms) >= 15:
             pop_score += 15
+            reasons.append(f"Missing {len(missing_terms)}+ LSI terms")
+        elif len(missing_terms) >= 10:
+            pop_score += 10
+            reasons.append(f"Missing {len(missing_terms)} LSI terms")
+        elif len(missing_terms) >= 5:
+            pop_score += 5
+            reasons.append(f"Missing {len(missing_terms)} LSI terms")
+
         pop_score = min(100, pop_score)
 
         if pop_score >= 80:
@@ -659,26 +775,41 @@ def _run_pop_audit_job(job_id, pid):
             "word_count_current": word_count_current,
             "word_count_target": word_count_target,
             "word_count_avg": word_count_avg,
+            "page_score": round(page_score, 1),
             "competitor_count": competitor_count,
             "tag_counts": tag_counts,
             "missing_terms": missing_terms,
-            "missing_terms_count": len(missing_terms)
+            "missing_terms_count": len(missing_terms),
+            "reasons": reasons
         }
 
-        # Save to DB
+        app.logger.info(f"POP audit {job_id}: metrics extracted - score={pop_score}, status={status}")
+
+        # ==================== Save to DB ====================
+        pop_jobs[job_id]["progress"] = "Saving results..."
+        
         db2 = sqlite3.connect(PROSPECTS_DB_PATH)
-        wc_current = report.get("wordCount", {}).get("current", 0) if report else 0
-        wc_target = report.get("wordCount", {}).get("target", 0) if report else 0
         db2.execute("""UPDATE prospects SET pop_report_data=?, pop_audit_date=?, pop_score=?,
             prospect_score=?, prospect_status=?, pop_word_count_current=?, pop_word_count_target=?, updated_at=? WHERE id=?""",
-            (json.dumps({"metrics": metrics, "report_data": report_data}), now_str(), pop_score, pop_score, status, wc_current, wc_target, now_str(), pid))
+            (json.dumps({"metrics": metrics, "report_data": final_report}), now_str(), pop_score, pop_score, status, 
+             word_count_current, word_count_target, now_str(), pid))
         db2.commit()
         db2.close()
 
-        pop_jobs[job_id] = {"status": "complete", "result": {"success": True, "metrics": metrics, "scoring": {"pop_score": pop_score, "status": status}}}
+        app.logger.info(f"POP audit {job_id}: completed successfully")
+        
+        pop_jobs[job_id] = {
+            "status": "complete", 
+            "result": {
+                "success": True, 
+                "metrics": metrics, 
+                "scoring": {"pop_score": pop_score, "status": status}
+            }
+        }
 
     except Exception as e:
-        pop_jobs[job_id] = {"status": "error", "error": str(e)}
+        app.logger.error(f"POP audit {job_id} failed: {e}")
+        pop_jobs[job_id] = {"status": "error", "error": str(e), "progress": "Failed"}
 
 
 @app.route("/api/pop_audit_start", methods=["POST", "GET"])
@@ -695,11 +826,22 @@ def pop_audit_start():
         return jsonify({"error": "Prospect not found"}), 404
 
     job_id = str(uuid.uuid4())[:8]
-    pop_jobs[job_id] = {"status": "running", "started": time.time()}
+    pop_jobs[job_id] = {
+        "status": "running", 
+        "started": time.time(),
+        "progress": "Initializing POP audit...",
+        "prospect_id": int(pid)
+    }
     t = threading.Thread(target=_run_pop_audit_job, args=(job_id, int(pid)), daemon=True)
     t.start()
 
-    return jsonify({"success": True, "job_id": job_id, "status": "running", "message": "POP audit started. Poll /api/pop_audit_status?job_id=X for results."})
+    return jsonify({
+        "success": True, 
+        "job_id": job_id, 
+        "status": "running", 
+        "message": "POP audit started. Poll /api/pop_audit_status?job_id=X for results.",
+        "estimated_time": "3-6 minutes"
+    })
 
 
 @app.route("/api/pop_audit_status", methods=["GET"])
@@ -713,14 +855,19 @@ def pop_audit_status():
     job = pop_jobs[job_id]
     if job["status"] == "running":
         elapsed = int(time.time() - job.get("started", 0))
-        return jsonify({"status": "running", "elapsed_seconds": elapsed})
+        progress = job.get("progress", "Processing...")
+        return jsonify({
+            "status": "running", 
+            "elapsed_seconds": elapsed,
+            "progress": progress
+        })
     elif job["status"] == "complete":
         result = job["result"]
-        del pop_jobs[job_id]  # cleanup
+        # Keep job for a bit to allow polling to get the result
+        # Cleanup happens on next poll or can be done manually
         return jsonify(result)
     else:
         error = job.get("error", "Unknown error")
-        del pop_jobs[job_id]
         return jsonify({"status": "error", "error": error}), 500
 
 
@@ -1046,29 +1193,42 @@ def get_pop_report():
     if not pid:
         return jsonify({"error": "prospect_id required"}), 400
     db = get_prospects_db()
-    prospect = row_to_dict(db.execute("SELECT id, business_name, website, pop_report_data, pop_audit_date, pop_score FROM prospects WHERE id = ?", (pid,)).fetchone())
+    prospect = row_to_dict(db.execute("SELECT id, business_name, website, pop_report_data, pop_audit_date, pop_score, pop_word_count_current, pop_word_count_target FROM prospects WHERE id = ?", (pid,)).fetchone())
     if not prospect:
         return jsonify({"error": "Prospect not found"}), 404
+    
     pop_data = None
     if prospect.get("pop_report_data"):
         try:
             pop_data = json.loads(prospect["pop_report_data"])
         except Exception:
             pop_data = prospect["pop_report_data"]
+    
     # Extract processed metrics for the frontend modal
     metrics = None
     keyword = prospect.get("business_name", "")
     website = prospect.get("website", "")
+    
     if pop_data and isinstance(pop_data, dict):
-        report = pop_data.get("report_data", {}).get("report", pop_data.get("report", {}))
+        # First check for pre-extracted metrics from the async job
+        pre_metrics = pop_data.get("metrics", {})
+        
+        # Get the report data - could be nested in different ways
+        report_data = pop_data.get("report_data", pop_data)
+        if isinstance(report_data, dict):
+            report = report_data.get("report", report_data.get("data", {}).get("report", report_data))
+        else:
+            report = {}
+        
         if report:
             word_count = report.get("wordCount", {})
             tag_counts = report.get("tagCounts", [])
             cb = report.get("cleanedContentBrief", {})
             p_total = cb.get("pTotal", {})
             page_score_data = cb.get("pageScore", {})
-            page_score = 0
-            if isinstance(page_score_data, dict):
+            page_score = pre_metrics.get("page_score", 0)
+            
+            if not page_score and isinstance(page_score_data, dict):
                 page_score = page_score_data.get("pageScore", 0)
             elif isinstance(page_score_data, (int, float)):
                 page_score = page_score_data
@@ -1076,12 +1236,17 @@ def get_pop_report():
             keyword = report.get("keyword", keyword)
             website = report.get("url", website)
 
+            # Use pre-extracted word counts or fall back to extracting from report
+            wc_current = pre_metrics.get("word_count_current", 0) or word_count.get("current", 0) or prospect.get("pop_word_count_current", 0)
+            wc_target = pre_metrics.get("word_count_target", 0) or word_count.get("target", 0) or prospect.get("pop_word_count_target", 0)
+            wc_avg = pre_metrics.get("word_count_avg", 0) or word_count.get("competitorAvg", word_count.get("avg", 0))
+
             metrics = {
-                "page_score": round(page_score, 1),
-                "word_count_current": word_count.get("current", 0),
-                "word_count_target": word_count.get("target", 0),
-                "word_count_avg": word_count.get("competitorAvg", word_count.get("avg", 0)),
-                "competitor_count": len(report.get("competitors", [])),
+                "page_score": round(page_score, 1) if page_score else 0,
+                "word_count_current": wc_current,
+                "word_count_target": wc_target,
+                "word_count_avg": wc_avg,
+                "competitor_count": pre_metrics.get("competitor_count", len(report.get("competitors", []))),
                 "tag_counts": tag_counts if isinstance(tag_counts, list) else [],
                 "terms_current": p_total.get("current", 0),
                 "terms_target_min": p_total.get("min", 0),
@@ -1093,9 +1258,10 @@ def get_pop_report():
                 "competitors": report.get("competitors", []),
                 "schema_types": report.get("schemaTypes", []),
                 "ai_schema_types": report.get("aiGenSchemaTypes", []),
-                "missing_terms": [],
+                "missing_terms": pre_metrics.get("missing_terms", []),
                 "target_schema": report.get("schemaTypes", []) or report.get("aiGenSchemaTypes", [])
             }
+            
             # Extract all content brief terms
             if cb and cb.get("p"):
                 for item in cb["p"]:
@@ -1113,8 +1279,9 @@ def get_pop_report():
                         "weight": t.get("weight", 0),
                         "met": current >= target_min if target_min > 0 else (current > 0)
                     })
-                    if current < target_min and target_min > 0:
+                    if current < target_min and target_min > 0 and t.get("phrase") not in metrics["missing_terms"]:
                         metrics["missing_terms"].append(t.get("phrase", ""))
+    
     return jsonify({
         "success": True, "prospect_id": pid,
         "pop_audit_date": prospect.get("pop_audit_date"), "pop_score": prospect.get("pop_score"),
