@@ -578,7 +578,11 @@ def _poll_pop_task(task_id, step_name="task", max_attempts=240, poll_interval=3)
             
             app.logger.info(f"POP {step_name} poll (attempt {attempt+1}): status={status}, value={value}, msg={msg}")
             
-            if status == "SUCCESS" or value == 100:
+            if status == "SUCCESS":
+                return data
+            # value==100 with PROGRESS means "calculating done" but data not ready yet
+            # Only return if we actually have useful data
+            if value == 100 and (data.get("prepareId") or data.get("data", {}).get("prepareId") or data.get("report")):
                 return data
             elif status == "FAILURE":
                 raise Exception(f"POP {step_name} failed: {msg}")
