@@ -1058,7 +1058,7 @@ def backfill_pop_scores():
     
     db = get_db()
     # Get all prospects with pop_report_data
-    rows = db.execute("SELECT id, pop_report_data, pop_score, pop_word_count_current, pop_word_count_target FROM prospects WHERE pop_report_data IS NOT NULL").fetchall()
+    rows = db.execute("SELECT id, pop_report_data, pop_score FROM prospects WHERE pop_report_data IS NOT NULL").fetchall()
     
     fixed = []
     for row in rows:
@@ -1097,12 +1097,10 @@ def backfill_pop_scores():
                 status = 'cold'
             
             old_score = row['pop_score']
-            wc_cur_db = row['pop_word_count_current'] or 0
-            wc_target_db = row['pop_word_count_target'] or 0
             
-            if old_score != new_score or wc_cur_db == 0 or wc_target_db == 0:
-                db.execute("UPDATE prospects SET pop_score=?, prospect_status=?, pop_word_count_current=?, pop_word_count_target=? WHERE id=?", 
-                           (new_score, status, wc_current, wc_target, row['id']))
+            if old_score != new_score:
+                db.execute("UPDATE prospects SET pop_score=?, prospect_status=? WHERE id=?", 
+                           (new_score, status, row['id']))
                 fixed.append({"id": row['id'], "old_score": old_score, "new_score": new_score, "status": status, "page_score": page_score})
         except Exception as e:
             fixed.append({"id": row['id'], "error": str(e)})
